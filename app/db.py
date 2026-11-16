@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS compartments (
     UNIQUE (map_version_id, code)
 );
 
+CREATE TABLE IF NOT EXISTS originals (
+    sha256          TEXT PRIMARY KEY,
+    byte_length     INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS batches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
@@ -46,7 +52,8 @@ CREATE TABLE IF NOT EXISTS batches (
     sha256          TEXT NOT NULL,
     row_count       INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
-    published_run_id INTEGER
+    published_run_id INTEGER,
+    original_sha256 TEXT REFERENCES originals(sha256)
 );
 
 CREATE TABLE IF NOT EXISTS hotspots (
@@ -113,6 +120,7 @@ def init_db(db_path: str) -> None:
             # switching can briefly return SQLITE_BUSY, hence the retry.
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            _migrate(conn)
             return
         except sqlite3.OperationalError as exc:
             last_error = exc
@@ -121,6 +129,20 @@ def init_db(db_path: str) -> None:
             conn.close()
     assert last_error is not None
     raise last_error
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring pre-archive databases forward (idempotent).
+
+    Batches created before the original-file archive existed keep
+    ``original_sha256 = NULL`` and are shown as "原件不可取" in the UI.
+    """
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+    if "original_sha256" not in columns:
+        conn.execute(
+            "ALTER TABLE batches ADD COLUMN original_sha256 TEXT REFERENCES originals(sha256)"
+        )
 
 
 @contextmanager

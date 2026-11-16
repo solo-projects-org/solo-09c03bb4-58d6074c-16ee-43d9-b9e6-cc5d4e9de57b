@@ -56,7 +56,7 @@
     <thead>
       <tr>
         <th>批次</th><th>文件</th><th>热点数</th><th>已发布结果</th>
-        <th>已赋码</th><th>冲突</th><th>未匹配</th><th>底图</th><th>操作</th>
+        <th>已赋码</th><th>冲突</th><th>未匹配</th><th>底图</th><th>原件</th><th>操作</th>
       </tr>
     </thead>
     <tbody>
@@ -79,6 +79,13 @@
         <td>{{ b.pub_conflict if b.pub_conflict is not none else '—' }}</td>
         <td>{{ b.pub_unmatched if b.pub_unmatched is not none else '—' }}</td>
         <td>{% if b.pub_map_id %}v{{ b.pub_map_id }}{% else %}—{% endif %}</td>
+        <td>
+          {% if b.original_sha256 %}
+            <a href="/batches/{{ b.id }}/original.csv" title="下载原始 CSV">已归档</a>
+          {% else %}
+            <span class="muted">不可取</span>
+          {% endif %}
+        </td>
         <td class="actions">
           <a class="button" href="/batches/{{ b.id }}">查看</a>
           {% if b.pub_run_id %}

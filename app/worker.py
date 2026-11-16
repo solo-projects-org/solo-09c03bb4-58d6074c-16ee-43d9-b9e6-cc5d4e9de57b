@@ -22,15 +22,22 @@ class Worker(threading.Thread):
         poll_interval: float = 0.2,
         stale_seconds: int = 120,
         chunk_size: int = 2000,
+        originals_dir: str | None = None,
+        original_stale_seconds: int = 3600,
+        cleanup_interval: float = 600.0,
     ) -> None:
         super().__init__(name="forest-worker", daemon=True)
         self.db_path = db_path
         self.poll_interval = poll_interval
         self.stale_seconds = stale_seconds
         self.chunk_size = chunk_size
+        self.originals_dir = originals_dir
+        self.original_stale_seconds = original_stale_seconds
+        self.cleanup_interval = cleanup_interval
         self._stop_event = threading.Event()
         self._wake = threading.Event()
         self._last_recovery = 0.0
+        self._last_cleanup = 0.0
 
     def kick(self) -> None:
         self._wake.set()
@@ -63,12 +70,25 @@ class Worker(threading.Thread):
         import time
 
         now = time.monotonic()
-        if now - self._last_recovery < 30:
-            return
-        self._last_recovery = now
-        try:
-            recovered = service.recover_stale_runs(self.db_path, self.stale_seconds)
-            if recovered:
-                log.warning("requeued %s stale run(s)", recovered)
-        except Exception:  # noqa: BLE001
-            log.exception("stale-run recovery failed")
+        if now - self._last_recovery >= 30:
+            self._last_recovery = now
+            try:
+                recovered = service.recover_stale_runs(self.db_path, self.stale_seconds)
+                if recovered:
+                    log.warning("requeued %s stale run(s)", recovered)
+            except Exception:  # noqa: BLE001
+                log.exception("stale-run recovery failed")
+        if now - self._last_cleanup >= self.cleanup_interval:
+            self._last_cleanup = now
+            try:
+                removed_tmp, removed_orphans = service.cleanup_originals(
+                    self.db_path, self.originals_dir, self.original_stale_seconds
+                )
+                if removed_tmp or removed_orphans:
+                    log.info(
+                        "original cleanup: removed %s temp, %s orphan file(s)",
+                        removed_tmp,
+                        removed_orphans,
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception("original cleanup failed")

@@ -43,6 +43,7 @@ from .attribution import (
     CompartmentGeometry,
     HotspotPoint,
 )
+from .originals import OriginalStore
 from .parsing import (
     Compartment,
     InputError,
@@ -217,20 +218,47 @@ def _insert_hotspots(conn: sqlite3.Connection, batch_id: int, hotspots: Sequence
     )
 
 
-def create_batch(db_path: str, data: bytes, filename: str) -> tuple[int, int | None]:
-    """Store a hotspot batch and (if a map exists) enqueue its first run."""
+def create_batch(
+    db_path: str, data: bytes, filename: str, originals_dir: str | None = None
+) -> tuple[int, int | None]:
+    """Archive the original CSV, then store the batch and enqueue its first run.
+
+    Ordering guarantee: the original bytes are fully on disk (``deposit``)
+    before the batch row exists, and the digest/length registration happens in
+    the same ``BEGIN IMMEDIATE`` transaction as the batch insert — so a batch
+    is only accepted, and attribution only queued, once the original is both
+    persisted and registered.  An interrupted deposit or registration leaves
+    no batch behind and is safe to retry: the content-addressed file and the
+    ``INSERT OR IGNORE`` registration are both idempotent.
+    """
 
     hotspots = parse_hotspots_csv(data, filename)
     digest = sha256_bytes(data)
+    store = OriginalStore(originals_dir) if originals_dir else OriginalStore.for_db(db_path)
+    store.deposit(data, digest)
     created_at = db.utc_now()
     with db.connection(db_path) as conn:
         with db.write_tx(conn):
+            # Under the write lock: if startup cleanup removed the still-
+            # unregistered file after our deposit, put it back before commit.
+            store.ensure(data, digest)
+            conn.execute(
+                "INSERT OR IGNORE INTO originals (sha256, byte_length, created_at) VALUES (?, ?, ?)",
+                (digest, len(data), created_at),
+            )
             cur = conn.execute(
                 """
-                INSERT INTO batches (name, filename, sha256, row_count, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO batches (name, filename, sha256, row_count, created_at, original_sha256)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (Path(filename).stem or "热点批次", filename, digest, len(hotspots), created_at),
+                (
+                    Path(filename).stem or "热点批次",
+                    filename,
+                    digest,
+                    len(hotspots),
+                    created_at,
+                    digest,
+                ),
             )
             batch_id = int(cur.lastrowid)
             _insert_hotspots(conn, batch_id, hotspots)
@@ -239,6 +267,51 @@ def create_batch(db_path: str, data: bytes, filename: str) -> tuple[int, int | N
             if active is not None:
                 run_id = _insert_run(conn, batch_id, active.id)
     return batch_id, run_id
+
+
+def get_original_info(conn: sqlite3.Connection, batch: dict[str, Any]) -> dict[str, Any] | None:
+    """Registry entry for a batch's archived original, or ``None``.
+
+    ``None`` means the batch predates the archive (or its registration) — the
+    UI shows such originals as 不可取 while attribution details keep working.
+    """
+
+    digest = batch.get("original_sha256")
+    if not digest:
+        return None
+    row = conn.execute(
+        "SELECT sha256, byte_length, created_at FROM originals WHERE sha256 = ?",
+        (digest,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "sha256": row["sha256"],
+        "byte_length": row["byte_length"],
+        "created_at": row["created_at"],
+    }
+
+
+def cleanup_originals(
+    db_path: str, originals_dir: str | None = None, stale_seconds: float = 3600
+) -> tuple[int, int]:
+    """Remove ownerless remnants; returns ``(temp_removed, orphan_removed)``.
+
+    Never deletes an original referenced by a batch, nor anything fresh enough
+    to be an in-flight upload/registration on another instance.  The orphan
+    check runs inside a write transaction so it is serialised against
+    registration commits from any instance.
+    """
+
+    store = OriginalStore(originals_dir) if originals_dir else OriginalStore.for_db(db_path)
+    removed_tmp = store.clean_tmp(stale_seconds)
+    with db.connection(db_path) as conn:
+        with db.write_tx(conn):
+            registered = {
+                row["sha256"] for row in conn.execute("SELECT sha256 FROM originals")
+            }
+            removed_orphans = store.clean_unregistered(registered, stale_seconds)
+    return removed_tmp, removed_orphans
 
 
 def enqueue_recompute(db_path: str, batch_id: int) -> int:

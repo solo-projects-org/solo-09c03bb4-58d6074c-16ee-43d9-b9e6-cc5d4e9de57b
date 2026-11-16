@@ -21,8 +21,38 @@
   {% if pending %}
     <p class="note">计算进行中，本页显示的是上一份已发布结果；刷新查看最新状态。</p>
   {% endif %}
+</section>
 
-  {% if published %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h2>原始 CSV</h2>
+      {% if original %}
+        <p class="hint">
+          状态：<span class="pill pill-ok">已归档</span>
+          不可变原件，两个实例共享同一物理文件；下载前会复核长度与 SHA-256。
+        </p>
+        <p class="hint mono">
+          SHA-256 {{ original.sha256 }}<br>
+          长度 {{ original.byte_length }} 字节 · 归档于 {{ original.created_at }}
+        </p>
+      {% else %}
+        <p class="hint">状态：<span class="pill pill-mut">原件不可取</span></p>
+        <p class="hint">
+          该批次上传于原件归档启用之前，源文件未保留；已有归属明细不受影响，可照常查看与下载。
+        </p>
+      {% endif %}
+    </div>
+    {% if original %}
+      <div class="actions">
+        <a class="button secondary" href="/batches/{{ batch.id }}/original.csv">下载原始 CSV</a>
+      </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+{% if published %}
     <div class="stat-row">
       <div class="stat"><span class="num">{{ published.total_count }}</span><span class="lbl">来源热点</span></div>
       <div class="stat stat-ok"><span class="num">{{ published.matched_count }}</span><span class="lbl">已赋码</span></div>

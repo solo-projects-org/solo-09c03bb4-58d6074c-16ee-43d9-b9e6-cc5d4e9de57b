@@ -166,6 +166,85 @@ def test_two_servers_publish_single_consistent_version(tmp_path):
 
 
 @pytest.mark.slow
+def test_two_servers_archive_single_original(tmp_path):
+    """Same CSV uploaded to both instances at once: one immutable file, one
+    registry row, both batches serve the identical original bytes."""
+
+    db_path = tmp_path / "forest.db"
+    originals_dir = tmp_path / "originals"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        with httpx.Client(base_url=server_a.base, timeout=30) as client_a, httpx.Client(
+            base_url=server_b.base, timeout=30
+        ) as client_b:
+            upload_map(client_a, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+            payload = (SAMPLES / "hotspots.csv").read_bytes()
+
+            import hashlib
+            import threading
+
+            digest = hashlib.sha256(payload).hexdigest()
+            errors: list[BaseException] = []
+
+            def upload(client):
+                try:
+                    upload_hotspots(client, payload)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=upload, args=(client_a,)),
+                threading.Thread(target=upload, args=(client_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert not errors
+
+            # Exactly one physical file and one registry row for both batches.
+            files = [p for p in originals_dir.iterdir() if p.is_file()]
+            assert [p.name for p in files] == [digest]
+            from app import db
+
+            with db.connection(str(db_path)) as conn:
+                assert (
+                    conn.execute("SELECT COUNT(*) AS n FROM originals").fetchone()["n"] == 1
+                )
+                digests = {
+                    row["original_sha256"]
+                    for row in conn.execute("SELECT original_sha256 FROM batches")
+                }
+                assert digests == {digest}
+
+            # Either instance serves byte-identical originals for both batches.
+            for batch_id in (1, 2):
+                assert client_a.get(f"{client_a.base_url}/batches/{batch_id}/original.csv").content == payload
+                assert client_b.get(f"{client_b.base_url}/batches/{batch_id}/original.csv").content == payload
+
+            # A restart cleanup must not remove the referenced original.
+            server_b.stop()
+            server_b2 = Server(db_path, port_b, tmp_path)
+            server_b2.wait_ready()
+            try:
+                assert (originals_dir / digest).exists()
+                with httpx.Client(base_url=server_b2.base, timeout=30) as client_b2:
+                    assert (
+                        client_b2.get(f"{client_b2.base_url}/batches/1/original.csv").content
+                        == payload
+                    )
+            finally:
+                server_b2.stop()
+    finally:
+        server_a.stop()
+        server_b.stop()
+
+
+@pytest.mark.slow
 def test_concurrent_map_swaps_leave_exactly_one_active(tmp_path):
     db_path = tmp_path / "forest.db"
     port_a, port_b = free_port(), free_port()

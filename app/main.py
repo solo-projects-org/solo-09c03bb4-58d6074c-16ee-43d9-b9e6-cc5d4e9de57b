@@ -11,11 +11,12 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import __version__, db, service
+from .originals import OriginalStore
 from .parsing import InputError
 from .worker import Worker
 
@@ -24,8 +25,12 @@ log = logging.getLogger("forest.web")
 
 
 def _settings() -> dict[str, Any]:
+    db_path = os.environ.get("FOREST_DB_PATH", str(BASE_DIR.parent / "data" / "forest.db"))
     return {
-        "db_path": os.environ.get("FOREST_DB_PATH", str(BASE_DIR.parent / "data" / "forest.db")),
+        "db_path": db_path,
+        "originals_dir": os.environ.get("FOREST_ORIGINALS_DIR")
+        or str(Path(db_path).resolve().parent / "originals"),
+        "original_stale_seconds": int(os.environ.get("FOREST_ORIGINAL_STALE_SECONDS", "3600")),
         "upload_max_mb": int(os.environ.get("FOREST_UPLOAD_MAX_MB", "32")),
         "run_worker": os.environ.get("FOREST_RUN_WORKER", "1") not in {"0", "false", "no"},
         "stale_seconds": int(os.environ.get("FOREST_STALE_RUN_SECONDS", "120")),
@@ -36,17 +41,38 @@ def _settings() -> dict[str, Any]:
 def create_app(db_path: str | None = None, start_worker: bool | None = None) -> FastAPI:
     settings = _settings()
     settings["db_path"] = db_path or settings["db_path"]
+    if not os.environ.get("FOREST_ORIGINALS_DIR"):
+        # Keep the archive next to the (possibly overridden) database file.
+        settings["originals_dir"] = str(
+            Path(settings["db_path"]).resolve().parent / "originals"
+        )
     if start_worker is not None:
         settings["run_worker"] = start_worker
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         db.init_db(app.state.settings["db_path"])
+        try:
+            removed_tmp, removed_orphans = service.cleanup_originals(
+                app.state.settings["db_path"],
+                app.state.settings["originals_dir"],
+                app.state.settings["original_stale_seconds"],
+            )
+            if removed_tmp or removed_orphans:
+                log.info(
+                    "startup cleanup removed %s temp, %s orphan original(s)",
+                    removed_tmp,
+                    removed_orphans,
+                )
+        except Exception:  # noqa: BLE001 - cleanup failure must not block boot
+            log.exception("startup original cleanup failed")
         worker = None
         if app.state.settings["run_worker"]:
             worker = Worker(
                 app.state.settings["db_path"],
                 stale_seconds=app.state.settings["stale_seconds"],
+                originals_dir=app.state.settings["originals_dir"],
+                original_stale_seconds=app.state.settings["original_stale_seconds"],
             )
             worker.start()
         app.state.worker = worker
@@ -139,7 +165,10 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
         try:
             data = _read_upload(file, app.state.settings["upload_max_mb"], "热点 CSV")
             batch_id, run_id = service.create_batch(
-                app.state.settings["db_path"], data, _safe_filename(file.filename, "hotspots.csv")
+                app.state.settings["db_path"],
+                data,
+                _safe_filename(file.filename, "hotspots.csv"),
+                originals_dir=app.state.settings["originals_dir"],
             )
         except InputError as exc:
             return _redirect("/", err=str(exc))
@@ -173,6 +202,7 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 raise HTTPException(status_code=404, detail="热点批次不存在")
             active_map = service.get_active_map(c)
             published = service.get_published_run(c, batch)
+            original = service.get_original_info(c, batch)
             runs = service.list_runs(c, batch_id)
             counts = service.result_counts(c, published["id"]) if published else []
             preview = (
@@ -193,6 +223,7 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 "batch": batch,
                 "active_map": active_map,
                 "published": published,
+                "original": original,
                 "runs": runs,
                 "counts": counts,
                 "preview": preview,
@@ -214,12 +245,53 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
         if published is None:
             raise HTTPException(status_code=409, detail="该批次还没有可下载的计算结果")
         name = f"hotspot_attribution_batch{batch_id}_run{published['id']}.csv"
-        headers = {
-            "Content-Disposition": f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(name)}",
-            "Cache-Control": "no-store",
-        }
+        headers = _download_headers(name)
         return StreamingResponse(
             service.iter_result_csv(app.state.settings["db_path"], batch_id),
+            media_type="text/csv; charset=utf-8",
+            headers=headers,
+        )
+
+    @app.get("/batches/{batch_id}/original.csv")
+    def download_original(batch_id: int):
+        """Serve the archived original CSV, but only after an integrity check.
+
+        Length and SHA-256 are re-verified against the registry on every
+        request; a missing or corrupted original is refused rather than
+        silently served.
+        """
+
+        with conn() as c:
+            batch = service.get_batch(c, batch_id)
+            if batch is None:
+                raise HTTPException(status_code=404, detail="热点批次不存在")
+            info = service.get_original_info(c, batch)
+        if info is None:
+            raise HTTPException(
+                status_code=409,
+                detail="该批次上传于原件归档启用之前，源文件未保留，原件不可取",
+            )
+        store = OriginalStore(app.state.settings["originals_dir"])
+        ok, actual_length, actual_sha = store.verify(info["sha256"], info["byte_length"])
+        if not ok:
+            log.error(
+                "original %s for batch %s failed integrity check (length=%s sha256=%s)",
+                info["sha256"],
+                batch_id,
+                actual_length,
+                actual_sha,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="归档原件校验失败（长度或 SHA-256 与登记不符），原件已损坏，拒绝提供",
+            )
+        name = batch["filename"] or f"hotspots_batch{batch_id}.csv"
+        headers = {
+            **_download_headers(name),
+            "X-Content-SHA256": info["sha256"],
+        }
+        return FileResponse(
+            store.final_path(info["sha256"]),
             media_type="text/csv; charset=utf-8",
             headers=headers,
         )
@@ -233,6 +305,7 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             if batch is None:
                 raise HTTPException(status_code=404, detail="热点批次不存在")
             published = service.get_published_run(c, batch)
+            original = service.get_original_info(c, batch)
             runs = service.list_runs(c, batch_id, limit=10)
         return {
             "batch_id": batch_id,
@@ -242,6 +315,11 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             "matched": published["matched_count"] if published else None,
             "conflict": published["conflict_count"] if published else None,
             "unmatched": published["unmatched_count"] if published else None,
+            "original": (
+                {"sha256": original["sha256"], "byte_length": original["byte_length"]}
+                if original
+                else None
+            ),
             "pending": any(
                 run["status"] in (service.STATUS_QUEUED, service.STATUS_RUNNING) for run in runs
             ),
@@ -280,6 +358,20 @@ def _read_upload(file: UploadFile, max_mb: int, what: str) -> bytes:
 def _safe_filename(name: str | None, fallback: str) -> str:
     text = Path(name or "").name.strip()
     return text or fallback
+
+
+def _download_headers(filename: str) -> dict[str, str]:
+    """Content-Disposition with an ASCII fallback plus RFC 5987 UTF-8 name."""
+
+    ascii_fallback = "".join(
+        ch if ord(ch) < 128 and ch not in {'"', "\\"} else "_" for ch in filename
+    )
+    return {
+        "Content-Disposition": (
+            f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+        ),
+        "Cache-Control": "no-store",
+    }
 
 
 def _redirect(path: str, msg: str | None = None, err: str | None = None) -> RedirectResponse:
